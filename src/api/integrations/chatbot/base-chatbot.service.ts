@@ -136,6 +136,20 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
         return;
       }
 
+      // For existing sessions, check if it is expired
+      const expire = (settings as any)?.expire || 0; // in minutes
+      if (expire > 0 && session.createdAt && Date.now() - session.createdAt.getTime() > expire * 60 * 1000) {
+        await this.prismaRepository.integrationSession.delete({
+          where: {
+            id: session.id,
+          },
+        });
+
+        await this.initNewSession(instance, remoteJid, bot, settings, session, content, pushName, msg);
+
+        return;
+      }
+
       // For existing sessions, keywords might indicate the conversation should end
       const keywordFinish = (settings as any)?.keywordFinish || '';
       const normalizedContent = content.toLowerCase().trim();
