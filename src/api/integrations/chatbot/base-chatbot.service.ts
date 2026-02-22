@@ -136,6 +136,10 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
         return;
       }
 
+      if (this.isAudioMessage(content) && msg) {
+        return;
+      }
+
       // For existing sessions, keywords might indicate the conversation should end
       const keywordFinish = (settings as any)?.keywordFinish || '';
       const normalizedContent = content.toLowerCase().trim();
