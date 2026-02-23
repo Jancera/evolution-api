@@ -234,6 +234,19 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
 
       this.logger.log(`Got response from OpenAI: ${message?.substring(0, 50)}${message?.length > 50 ? '...' : ''}`);
 
+      // Handle #FINISH keyword: strip it, send cleaned message, and pause session
+      const RESPONSE_FINISH_KEYWORD = '#FINISH';
+      const pattern = new RegExp(`\\s*${RESPONSE_FINISH_KEYWORD}\\s*$`, 'i');
+      if (message && pattern.test(message)) {
+        const cleanedMessage = message.replace(pattern, '').trim();
+        await this.sendMessageWhatsApp(instance, remoteJid, cleanedMessage, settings, true);
+        await this.prismaRepository.integrationSession.update({
+          where: { id: session.id },
+          data: { status: 'paused', awaitUser: true },
+        });
+        return;
+      }
+
       // Send the response
       if (message) {
         this.logger.log('Sending message to WhatsApp');
