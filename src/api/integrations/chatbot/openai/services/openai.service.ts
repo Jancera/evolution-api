@@ -130,6 +130,12 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         return;
       }
 
+      // If session exists but is closed - do not process
+      if (session?.status === 'closed') {
+        this.logger.log(`Ignoring message for closed session ${session.id}`);
+        return;
+      }
+
       // If session is new or doesn't exist
       if (!session) {
         const data = {
@@ -233,6 +239,15 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
       }
 
       this.logger.log(`Got response from OpenAI: ${message?.substring(0, 50)}${message?.length > 50 ? '...' : ''}`);
+
+      // Re-fetch session to verify it wasn't closed during API processing
+      const currentSession = await this.prismaRepository.integrationSession.findUnique({
+        where: { id: session.id },
+      });
+      if (!currentSession || currentSession.status === 'closed') {
+        this.logger.log(`Session ${session.id} is closed, skipping WhatsApp response`);
+        return;
+      }
 
       // Handle #FINISH keyword: strip it, send cleaned message, and pause session
       const RESPONSE_FINISH_KEYWORD = '#FINISH';
