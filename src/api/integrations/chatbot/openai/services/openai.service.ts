@@ -242,7 +242,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         await this.sendMessageWhatsApp(instance, remoteJid, cleanedMessage, settings, true);
         await this.prismaRepository.integrationSession.update({
           where: { id: session.id },
-          data: { status: 'paused', awaitUser: true },
+          data: { status: 'closed', awaitUser: true },
         });
         return;
       }
