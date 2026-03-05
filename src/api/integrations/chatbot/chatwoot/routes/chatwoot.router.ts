@@ -39,6 +39,13 @@ export class ChatwootRouter extends RouterBroker {
         });
 
         res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('importFromDb'), ...guards, async (req, res) => {
+        const instance = { instanceName: req.params.instanceName } as InstanceDto;
+        const daysLimit = req.query.daysLimit ? Number(req.query.daysLimit) : undefined;
+        const batchSize = req.query.batchSize ? Math.min(10000, Math.max(1000, Number(req.query.batchSize))) : 5000;
+        const response = await chatwootController.importFromEvolutionDb(instance, daysLimit, batchSize);
+        res.status(HttpStatus.OK).json(response);
       });
   }
 

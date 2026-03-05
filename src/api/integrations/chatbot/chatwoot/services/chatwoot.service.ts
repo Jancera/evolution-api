@@ -9,6 +9,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { Events } from '@api/types/wa.types';
 import { Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
 import { Logger } from '@config/logger.config';
+import { BadRequestException, NotFoundException } from '@exceptions';
 import ChatwootClient, {
   ChatwootAPIConfig,
   contact,
@@ -2710,5 +2711,123 @@ export class ChatwootService {
     } catch {
       return;
     }
+  }
+
+  private prepareMessageForImport(msg: MessageModel): {
+    key: any;
+    message: any;
+    messageTimestamp: number;
+    pushName?: string;
+  } {
+    let messageTimestamp = msg.messageTimestamp as number;
+    if (Long.isLong(msg.messageTimestamp)) {
+      messageTimestamp = (msg.messageTimestamp as unknown as Long).toNumber();
+    }
+    return {
+      key: msg.key,
+      message: msg.message,
+      messageTimestamp,
+      pushName: msg.pushName ?? undefined,
+    };
+  }
+
+  public async importFromEvolutionDb(
+    instanceName: string,
+    daysLimit?: number,
+    batchSize?: number,
+  ): Promise<{ totalMessagesImported: number; batchesProcessed: number }> {
+    const effectiveBatchSize = Math.min(10000, Math.max(1000, batchSize ?? 5000));
+
+    const instance = await this.prismaRepository.instance.findFirst({
+      where: { name: instanceName },
+      include: { Chatwoot: true },
+    });
+
+    if (!instance) {
+      throw new NotFoundException(`Instance "${instanceName}" not found`);
+    }
+
+    if (!instance.Chatwoot || !instance.Chatwoot.enabled) {
+      throw new BadRequestException('Chatwoot not configured for this instance');
+    }
+
+    const importUri = this.configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI;
+    if (!importUri || importUri === 'postgres://user:password@hostname:port/dbname') {
+      throw new BadRequestException('CHATWOOT_IMPORT_DATABASE_CONNECTION_URI is not set');
+    }
+
+    this.provider = instance.Chatwoot;
+    const client = new ChatwootClient({
+      config: this.getClientCwConfig(),
+    });
+
+    const inboxList = (await client.inboxes.list({
+      accountId: this.provider.accountId,
+    })) as any;
+
+    if (!inboxList?.payload) {
+      throw new BadRequestException('Inbox not found in Chatwoot');
+    }
+
+    const inbox = inboxList.payload.find((i: any) => i.name === this.provider.nameInbox);
+    if (!inbox) {
+      throw new BadRequestException('Inbox not found in Chatwoot');
+    }
+
+    const instanceDto: InstanceDto = {
+      instanceName,
+      instanceId: instance.id,
+    };
+
+    chatwootImport.clearAll(instanceDto);
+
+    const where: any = { instanceId: instance.id };
+    if (daysLimit) {
+      where.messageTimestamp = { gte: dayjs().subtract(daysLimit, 'day').unix() };
+    }
+
+    let totalMessagesImported = 0;
+    let batchesProcessed = 0;
+    let lastId: string | undefined;
+    let done = false;
+
+    while (!done) {
+      const batch = await this.prismaRepository.message.findMany({
+        where,
+        take: effectiveBatchSize,
+        ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {}),
+        orderBy: { messageTimestamp: 'asc' },
+      });
+
+      if (batch.length === 0) {
+        done = true;
+        continue;
+      }
+
+      const filtered = batch.filter((msg) => !chatwootImport.isIgnorePhoneNumber((msg.key as any)?.remoteJid));
+      const prepared = filtered
+        .filter((msg) => msg.message && msg.key && msg.messageTimestamp != null)
+        .map((msg) => this.prepareMessageForImport(msg));
+
+      if (prepared.length > 0) {
+        chatwootImport.addHistoryMessages(instanceDto, prepared as MessageModel[]);
+        const imported = await chatwootImport.importHistoryMessages(
+          instanceDto,
+          this,
+          inbox,
+          this.provider as ChatwootModel,
+        );
+        totalMessagesImported += Number.isInteger(imported) ? imported : 0;
+      }
+
+      batchesProcessed++;
+      lastId = batch[batch.length - 1].id;
+
+      if (batch.length < effectiveBatchSize) {
+        done = true;
+      }
+    }
+
+    return { totalMessagesImported, batchesProcessed };
   }
 }

@@ -81,4 +81,11 @@ export class ChatwootController {
 
     return this.chatwootService.receiveWebhook(instance, data);
   }
+
+  public async importFromEvolutionDb(instance: InstanceDto, daysLimit?: number, batchSize?: number) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+      throw new BadRequestException('Chatwoot is disabled');
+    }
+    return this.chatwootService.importFromEvolutionDb(instance.instanceName, daysLimit, batchSize);
+  }
 }
