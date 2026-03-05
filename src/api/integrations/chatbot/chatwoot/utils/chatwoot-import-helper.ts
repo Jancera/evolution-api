@@ -2,7 +2,6 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
-import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
 import { Chatwoot as ChatwootModel, Contact, Message } from '@prisma/client';
@@ -254,7 +253,7 @@ class ChatwootImport {
       });
 
       const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(`WAID:${message.key.id}`));
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -500,10 +499,7 @@ class ChatwootImport {
       return contentMessage;
     }
 
-    if (!configService.get<Chatwoot>('CHATWOOT').IMPORT.PLACEHOLDER_MEDIA_MESSAGE) {
-      return '';
-    }
-
+    // Always use placeholder for media/unknown types so we never skip messages during import
     const types = {
       documentMessage: msg.message.documentMessage,
       documentWithCaptionMessage: msg.message.documentWithCaptionMessage?.message?.documentMessage,
@@ -512,6 +508,10 @@ class ChatwootImport {
       audioMessage: msg.message.audioMessage,
       stickerMessage: msg.message.stickerMessage,
       templateMessage: msg.message.templateMessage?.hydratedTemplate?.hydratedContentText,
+      reactionMessage: msg.message.reactionMessage,
+      protocolMessage: msg.message.protocolMessage,
+      viewOnceMessageV2: msg.message.viewOnceMessageV2,
+      ephemeralMessage: msg.message.ephemeralMessage,
     };
 
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined && types[key] !== null);
@@ -534,7 +534,7 @@ class ChatwootImport {
         const template = msg.message.templateMessage?.hydratedTemplate;
         return (
           (template?.hydratedTitleText ? `*${template.hydratedTitleText}*\n` : '') +
-          (template?.hydratedContentText || '')
+          (template?.hydratedContentText || '_<Template Message>_')
         );
       }
 
@@ -550,8 +550,20 @@ class ChatwootImport {
       case 'stickerMessage':
         return '_<Sticker Message>_';
 
+      case 'reactionMessage':
+        return '_<Reaction>_';
+
+      case 'protocolMessage':
+        return '_<System Message>_';
+
+      case 'viewOnceMessageV2':
+        return '_<View Once Message>_';
+
+      case 'ephemeralMessage':
+        return '_<Ephemeral Message>_';
+
       default:
-        return '';
+        return '_<Message>_';
     }
   }
 

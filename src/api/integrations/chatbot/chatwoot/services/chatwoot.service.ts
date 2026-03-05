@@ -2781,6 +2781,22 @@ export class ChatwootService {
 
     chatwootImport.clearAll(instanceDto);
 
+    // Import contacts first so messages are wrapped around the correct contact (phone number)
+    const evolutionContacts = await this.prismaRepository.contact.findMany({
+      where: { instanceId: instance.id },
+    });
+    const contactsToImport = evolutionContacts.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    if (contactsToImport.length > 0) {
+      chatwootImport.addHistoryContacts(instanceDto, contactsToImport);
+      const providerData: ChatwootDto = {
+        ...this.provider,
+        ignoreJids: Array.isArray(this.provider.ignoreJids)
+          ? this.provider.ignoreJids.map((event) => String(event))
+          : [],
+      };
+      await chatwootImport.importHistoryContacts(instanceDto, providerData);
+    }
+
     const where: any = { instanceId: instance.id };
     if (daysLimit) {
       where.messageTimestamp = { gte: dayjs().subtract(daysLimit, 'day').unix() };
@@ -2826,6 +2842,22 @@ export class ChatwootService {
       if (batch.length < effectiveBatchSize) {
         done = true;
       }
+    }
+
+    // Re-import contacts at end (for re-runs when messages already imported, ensures contact names are updated)
+    const evolutionContactsEnd = await this.prismaRepository.contact.findMany({
+      where: { instanceId: instance.id },
+    });
+    const contactsToImportEnd = evolutionContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    if (contactsToImportEnd.length > 0) {
+      chatwootImport.addHistoryContacts(instanceDto, contactsToImportEnd);
+      const providerDataEnd: ChatwootDto = {
+        ...this.provider,
+        ignoreJids: Array.isArray(this.provider.ignoreJids)
+          ? this.provider.ignoreJids.map((event) => String(event))
+          : [],
+      };
+      await chatwootImport.importHistoryContacts(instanceDto, providerDataEnd);
     }
 
     return { totalMessagesImported, batchesProcessed };
