@@ -2806,6 +2806,7 @@ export class ChatwootService {
     let batchesProcessed = 0;
     let lastId: string | undefined;
     let done = false;
+    const contactsFromMessages = new Map<string, string>();
 
     while (!done) {
       const batch = await this.prismaRepository.message.findMany({
@@ -2824,6 +2825,15 @@ export class ChatwootService {
       const prepared = filtered
         .filter((msg) => msg.message && msg.key && msg.messageTimestamp != null)
         .map((msg) => this.prepareMessageForImport(msg));
+
+      for (const msg of filtered) {
+        const key = msg.key as { remoteJid?: string };
+        const remoteJid = key?.remoteJid;
+        if (remoteJid) {
+          const pushName = msg.pushName || remoteJid.split('@')[0];
+          contactsFromMessages.set(remoteJid, pushName);
+        }
+      }
 
       if (prepared.length > 0) {
         chatwootImport.addHistoryMessages(instanceDto, prepared as MessageModel[]);
@@ -2844,11 +2854,23 @@ export class ChatwootService {
       }
     }
 
-    // Re-import contacts at end (for re-runs when messages already imported, ensures contact names are updated)
+    // Re-import contacts at end: Evolution Contact table + contacts extracted from messages (@lid etc.)
     const evolutionContactsEnd = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
+    const evolutionRemoteJids = new Set(
+      evolutionContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid)).map((c) => c.remoteJid),
+    );
     const contactsToImportEnd = evolutionContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    for (const [remoteJid, pushName] of contactsFromMessages) {
+      if (!chatwootImport.isIgnorePhoneNumber(remoteJid) && !evolutionRemoteJids.has(remoteJid)) {
+        contactsToImportEnd.push({
+          remoteJid,
+          pushName: pushName || remoteJid.split('@')[0],
+          instanceId: instance.id,
+        } as ContactModel);
+      }
+    }
     if (contactsToImportEnd.length > 0) {
       chatwootImport.addHistoryContacts(instanceDto, contactsToImportEnd);
       const providerDataEnd: ChatwootDto = {
