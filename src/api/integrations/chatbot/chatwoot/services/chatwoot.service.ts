@@ -2826,9 +2826,11 @@ export class ChatwootService {
     const evolutionContacts = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
-    const contactsToImport = evolutionContacts
-      .map((c) => ({ ...c, remoteJid: resolveJid(c.remoteJid) }))
-      .filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    const contactsToImport = this.deduplicateContacts(
+      evolutionContacts
+        .map((c) => ({ ...c, remoteJid: resolveJid(c.remoteJid) }))
+        .filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid)),
+    );
     if (contactsToImport.length > 0) {
       this.logger.info(`[${instanceName}] Importing ${contactsToImport.length} contacts`);
       chatwootImport.addHistoryContacts(instanceDto, contactsToImport as ContactModel[]);
@@ -2925,16 +2927,17 @@ export class ChatwootService {
     const evolutionRemoteJids = new Set(
       resolvedContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid)).map((c) => c.remoteJid),
     );
-    const contactsToImportEnd = resolvedContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    const contactsToImportEndRaw = resolvedContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
     for (const [remoteJid, pushName] of contactsFromMessages) {
       if (!chatwootImport.isIgnorePhoneNumber(remoteJid) && !evolutionRemoteJids.has(remoteJid)) {
-        contactsToImportEnd.push({
+        contactsToImportEndRaw.push({
           remoteJid,
           pushName: pushName || remoteJid.split('@')[0],
           instanceId: instance.id,
         } as ContactModel);
       }
     }
+    const contactsToImportEnd = this.deduplicateContacts(contactsToImportEndRaw);
     if (contactsToImportEnd.length > 0) {
       this.logger.info(
         `[${instanceName}] Re-importing ${contactsToImportEnd.length} contacts (including from messages)`,
@@ -2966,6 +2969,17 @@ export class ChatwootService {
     );
 
     return { totalMessagesImported, batchesProcessed, errors };
+  }
+
+  private deduplicateContacts(contacts: ContactModel[]): ContactModel[] {
+    const seen = new Map<string, ContactModel>();
+    for (const c of contacts) {
+      const existing = seen.get(c.remoteJid);
+      if (!existing || (c.pushName && !existing.pushName)) {
+        seen.set(c.remoteJid, c);
+      }
+    }
+    return Array.from(seen.values());
   }
 
   private async updateConversationsLastActivity(provider: ChatwootModel): Promise<void> {
