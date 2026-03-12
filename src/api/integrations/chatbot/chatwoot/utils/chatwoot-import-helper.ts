@@ -333,7 +333,6 @@ class ChatwootImport {
           });
           if (valuesCount > 0) {
             sqlInsertMsg = sqlInsertMsg.slice(0, -1);
-            sqlInsertMsg += ` ON CONFLICT DO NOTHING`;
             const result = await pgClient.query(sqlInsertMsg, bindInsertMsg);
             totalMessagesImported += result?.rowCount ?? 0;
             this.logger.info(
@@ -429,21 +428,33 @@ class ChatwootImport {
 
               new_contact_inbox AS (
                 INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
-                SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
-                FROM new_contact
-                ON CONFLICT (contact_id, inbox_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                SELECT nc.id, $2, gen_random_uuid(), nc.created_at, nc.updated_at
+                FROM new_contact nc
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM contact_inboxes ci
+                  WHERE ci.contact_id = nc.id AND ci.inbox_id = $2
+                )
                 RETURNING id, contact_id, created_at, updated_at
+              ),
+
+              all_contact_inboxes AS (
+                SELECT id, contact_id, created_at, updated_at FROM new_contact_inbox
+                UNION ALL
+                SELECT ci.id, ci.contact_id, ci.created_at, ci.updated_at
+                FROM new_contact nc
+                JOIN contact_inboxes ci ON ci.contact_id = nc.id AND ci.inbox_id = $2
+                WHERE nc.id NOT IN (SELECT contact_id FROM new_contact_inbox)
               ),
 
               new_conversation AS (
                 INSERT INTO conversations (account_id, inbox_id, status, contact_id,
                   contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
-                SELECT $1, $2, 0, nci.contact_id, nci.id, gen_random_uuid(),
-                  nci.updated_at, nci.created_at, nci.updated_at
-                FROM new_contact_inbox nci
+                SELECT $1, $2, 0, aci.contact_id, aci.id, gen_random_uuid(),
+                  aci.updated_at, aci.created_at, aci.updated_at
+                FROM all_contact_inboxes aci
                 WHERE NOT EXISTS (
                   SELECT 1 FROM conversations con
-                  WHERE con.contact_inbox_id = nci.id AND con.account_id = $1
+                  WHERE con.contact_inbox_id = aci.id AND con.account_id = $1
                 )
                 RETURNING id, contact_id
               )
@@ -452,15 +463,6 @@ class ChatwootImport {
                 nc.id AS contact_id, nconv.id AS conversation_id
               FROM new_conversation nconv
               JOIN new_contact nc ON nconv.contact_id = nc.id
-
-              UNION
-
-              SELECT nc.identifier AS contact_key, nc.phone_number,
-                nc.id AS contact_id, con.id AS conversation_id
-              FROM new_contact nc
-              JOIN new_contact_inbox nci ON nci.contact_id = nc.id
-              JOIN conversations con ON con.contact_inbox_id = nci.id AND con.account_id = $1
-              WHERE nc.id NOT IN (SELECT contact_id FROM new_conversation)
 
               UNION
 
@@ -491,17 +493,15 @@ class ChatwootImport {
   }
 
   /**
-   * Groups messages by full remoteJid to support @lid vs @s.whatsapp.net as separate conversations.
-   * Key = full remoteJid (e.g. "26998801960985@lid" or "553899316490@s.whatsapp.net")
+   * Groups messages by resolved remoteJid, preferring real phone (@s.whatsapp.net) over LID (@lid).
    */
   public createMessagesMapByPhoneNumber(messages: Message[]): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
-      const key = message?.key as { remoteJid: string };
-      const remoteJid = key?.remoteJid;
-      if (remoteJid && !this.isIgnorePhoneNumber(remoteJid)) {
-        const existing = acc.has(remoteJid) ? acc.get(remoteJid) : [];
+      const resolved = this.getResolvedRemoteJid(message?.key);
+      if (resolved && !this.isIgnorePhoneNumber(resolved)) {
+        const existing = acc.has(resolved) ? acc.get(resolved) : [];
         existing.push(message);
-        acc.set(remoteJid, existing);
+        acc.set(resolved, existing);
       }
       return acc;
     }, new Map());
@@ -605,6 +605,19 @@ class ChatwootImport {
 
   public sliceIntoChunks(arr: any[], chunkSize: number) {
     return arr.splice(0, chunkSize);
+  }
+
+  public getResolvedRemoteJid(messageKey: any): string | null {
+    const remoteJid = messageKey?.remoteJid as string;
+    const remoteJidAlt = messageKey?.remoteJidAlt as string;
+
+    if (!remoteJid) return null;
+
+    if (remoteJid.endsWith('@lid') && remoteJidAlt?.endsWith('@s.whatsapp.net')) {
+      return remoteJidAlt;
+    }
+
+    return remoteJid;
   }
 
   public isGroup(remoteJid: string) {

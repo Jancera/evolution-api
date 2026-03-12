@@ -2784,13 +2784,54 @@ export class ChatwootService {
 
     this.logger.info(`[${instanceName}] Starting importFromEvolutionDb (daysLimit=${daysLimit ?? 'none'})`);
 
+    const lidPhoneMap = new Map<string, string>();
+    {
+      let scanId: string | undefined;
+      let scanning = true;
+      while (scanning) {
+        const batch = await this.prismaRepository.message.findMany({
+          where: { instanceId: instance.id },
+          select: { id: true, key: true },
+          take: 10000,
+          ...(scanId ? { cursor: { id: scanId }, skip: 1 } : {}),
+          orderBy: { id: 'asc' },
+        });
+        for (const msg of batch) {
+          const key = msg.key as any;
+          if (key?.remoteJid?.endsWith('@lid') && key?.remoteJidAlt?.endsWith('@s.whatsapp.net')) {
+            lidPhoneMap.set(key.remoteJid, key.remoteJidAlt);
+          }
+        }
+        if (batch.length < 10000) {
+          scanning = false;
+        } else {
+          scanId = batch[batch.length - 1].id;
+        }
+      }
+      this.logger.info(`[${instanceName}] Built LID→phone mapping: ${lidPhoneMap.size} entries`);
+    }
+    const resolveJid = (jid: string) => lidPhoneMap.get(jid) || jid;
+
+    if (lidPhoneMap.size > 0) {
+      try {
+        const migrated = await this.migrateLidContactsInChatwoot(this.provider.accountId, lidPhoneMap, instanceName);
+        this.logger.info(`[${instanceName}] Migrated ${migrated} LID contacts to phone numbers in Chatwoot`);
+      } catch (error) {
+        const msg = `LID contact migration failed: ${error?.toString()}`;
+        this.logger.error(`[${instanceName}] ${msg}`);
+        errors.push(msg);
+      }
+    }
+
     const evolutionContacts = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
-    const contactsToImport = evolutionContacts.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    const contactsToImport = evolutionContacts
+      .map((c) => ({ ...c, remoteJid: resolveJid(c.remoteJid) }))
+      .filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
     if (contactsToImport.length > 0) {
       this.logger.info(`[${instanceName}] Importing ${contactsToImport.length} contacts`);
-      chatwootImport.addHistoryContacts(instanceDto, contactsToImport);
+      chatwootImport.addHistoryContacts(instanceDto, contactsToImport as ContactModel[]);
       const providerData: ChatwootDto = {
         ...this.provider,
         ignoreJids: Array.isArray(this.provider.ignoreJids)
@@ -2830,17 +2871,19 @@ export class ChatwootService {
         continue;
       }
 
-      const filtered = batch.filter((msg) => !chatwootImport.isIgnorePhoneNumber((msg.key as any)?.remoteJid));
+      const filtered = batch.filter((msg) => {
+        const resolved = chatwootImport.getResolvedRemoteJid(msg.key);
+        return resolved && !chatwootImport.isIgnorePhoneNumber(resolved);
+      });
       const prepared = filtered
         .filter((msg) => msg.message && msg.key && msg.messageTimestamp != null)
         .map((msg) => this.prepareMessageForImport(msg));
 
       for (const msg of filtered) {
-        const key = msg.key as { remoteJid?: string };
-        const remoteJid = key?.remoteJid;
-        if (remoteJid) {
-          const pushName = msg.pushName || remoteJid.split('@')[0];
-          contactsFromMessages.set(remoteJid, pushName);
+        const resolved = chatwootImport.getResolvedRemoteJid(msg.key);
+        if (resolved) {
+          const pushName = msg.pushName || resolved.split('@')[0];
+          contactsFromMessages.set(resolved, pushName);
         }
       }
 
@@ -2875,10 +2918,14 @@ export class ChatwootService {
     const evolutionContactsEnd = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
+    const resolvedContactsEnd = evolutionContactsEnd.map((c) => ({
+      ...c,
+      remoteJid: resolveJid(c.remoteJid),
+    }));
     const evolutionRemoteJids = new Set(
-      evolutionContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid)).map((c) => c.remoteJid),
+      resolvedContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid)).map((c) => c.remoteJid),
     );
-    const contactsToImportEnd = evolutionContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
+    const contactsToImportEnd = resolvedContactsEnd.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
     for (const [remoteJid, pushName] of contactsFromMessages) {
       if (!chatwootImport.isIgnorePhoneNumber(remoteJid) && !evolutionRemoteJids.has(remoteJid)) {
         contactsToImportEnd.push({
@@ -2892,7 +2939,7 @@ export class ChatwootService {
       this.logger.info(
         `[${instanceName}] Re-importing ${contactsToImportEnd.length} contacts (including from messages)`,
       );
-      chatwootImport.addHistoryContacts(instanceDto, contactsToImportEnd);
+      chatwootImport.addHistoryContacts(instanceDto, contactsToImportEnd as ContactModel[]);
       const providerDataEnd: ChatwootDto = {
         ...this.provider,
         ignoreJids: Array.isArray(this.provider.ignoreJids)
@@ -2935,5 +2982,48 @@ export class ChatwootService {
         AND conversations.account_id = $1
         AND (conversations.last_activity_at IS NULL OR conversations.last_activity_at < sub.max_created)`;
     await pgClient.query(sql, [provider.accountId]);
+  }
+
+  private async migrateLidContactsInChatwoot(
+    accountId: number,
+    lidPhoneMap: Map<string, string>,
+    instanceName: string,
+  ): Promise<number> {
+    if (lidPhoneMap.size === 0) return 0;
+
+    const pgClient = postgresClient.getChatwootConnection();
+    let migrated = 0;
+
+    for (const [lidJid, phoneJid] of lidPhoneMap) {
+      const phoneNumber = `+${phoneJid.split('@')[0]}`;
+      try {
+        const existingPhone = await pgClient.query(
+          `SELECT id FROM contacts WHERE identifier = $1 AND account_id = $2 LIMIT 1`,
+          [phoneJid, accountId],
+        );
+
+        if (existingPhone.rows.length > 0) {
+          const lidContact = await pgClient.query(
+            `SELECT id FROM contacts WHERE identifier = $1 AND account_id = $2 LIMIT 1`,
+            [lidJid, accountId],
+          );
+          if (lidContact.rows.length > 0) {
+            await pgClient.query(`DELETE FROM contacts WHERE id = $1`, [lidContact.rows[0].id]);
+            migrated++;
+          }
+        } else {
+          const result = await pgClient.query(
+            `UPDATE contacts SET identifier = $1, phone_number = $2, updated_at = NOW()
+             WHERE identifier = $3 AND account_id = $4`,
+            [phoneJid, phoneNumber, lidJid, accountId],
+          );
+          migrated += result.rowCount ?? 0;
+        }
+      } catch (error) {
+        this.logger.warn(`[${instanceName}] Failed to migrate LID contact ${lidJid}: ${error?.toString()}`);
+      }
+    }
+
+    return migrated;
   }
 }
