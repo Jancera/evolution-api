@@ -114,7 +114,10 @@ class ChatwootImport {
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
 
-          const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
+          const fallbackName = contact.remoteJid.split('@')[0];
+          const contactName = isGroup
+            ? `${contact.pushName || fallbackName} (GROUP)`
+            : contact.pushName || fallbackName;
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
@@ -173,6 +176,8 @@ class ChatwootImport {
       return totalContactsImported;
     } catch (error) {
       this.logger.error(`Error on import history contacts: ${error.toString()}`);
+      this.deleteHistoryContacts(instance);
+      throw error;
     }
   }
 
@@ -227,24 +232,19 @@ class ChatwootImport {
         return 0;
       }
 
-      // ordering messages by number and timestamp asc
+      this.logger.info(
+        `[${instance.instanceName}] Starting message import: ${messagesOrdered.length} messages to process`,
+      );
+
       messagesOrdered.sort((a, b) => {
-        const aKey = a.key as {
-          remoteJid: string;
-        };
-
-        const bKey = b.key as {
-          remoteJid: string;
-        };
-
+        const aKey = a.key as { remoteJid: string };
+        const bKey = b.key as { remoteJid: string };
         const aMessageTimestamp = a.messageTimestamp as any as number;
         const bMessageTimestamp = b.messageTimestamp as any as number;
-
         return parseInt(aKey.remoteJid) - parseInt(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
       const allMessagesMappedByRemoteJid = this.createMessagesMapByPhoneNumber(messagesOrdered);
-      // Map structure: remoteJid => { first, last } timestamps (supports @lid and @s.whatsapp.net separately)
       const remoteJidsWithTimestamp = new Map<string, firstLastTimestamp>();
       allMessagesMappedByRemoteJid.forEach((messages: Message[], remoteJid: string) => {
         remoteJidsWithTimestamp.set(remoteJid, {
@@ -253,13 +253,25 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
+      const allSourceIds = messagesOrdered.map((message: any) => message.key?.id).filter(Boolean);
+      const existingSourceIds = await this.getExistingSourceIds(allSourceIds);
       messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(`WAID:${message.key.id}`));
-      // processing messages in batch
-      const batchSize = 4000;
+
+      const seenKeyIds = new Set<string>();
+      messagesOrdered = messagesOrdered.filter((message: any) => {
+        const keyId = message.key?.id;
+        if (!keyId || seenKeyIds.has(keyId)) return false;
+        seenKeyIds.add(keyId);
+        return true;
+      });
+
+      this.logger.info(`[${instance.instanceName}] After dedup: ${messagesOrdered.length} new messages to import`);
+
+      const batchSize = 2000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
+      let chunkIndex = 0;
       while (messagesChunk.length > 0) {
-        // Map structure: remoteJid => Message[] (supports @lid and @s.whatsapp.net separately)
+        chunkIndex++;
         const messagesByRemoteJid = this.createMessagesMapByPhoneNumber(messagesChunk);
 
         if (messagesByRemoteJid.size > 0) {
@@ -270,17 +282,17 @@ class ChatwootImport {
             messagesByRemoteJid,
           );
 
-          // inserting messages in chatwoot db
           let sqlInsertMsg = `INSERT INTO messages
             (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type,
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
-          const bindInsertMsg = [provider.accountId, inbox.id];
+          const bindInsertMsg: any[] = [provider.accountId, inbox.id];
+          let valuesCount = 0;
 
           messagesByRemoteJid.forEach((messages: any[], remoteJid: string) => {
             const fksChatwoot = fksByRemoteJid.get(remoteJid);
 
             messages.forEach((message) => {
-              if (!message.message) {
+              if (!message.message || !message.key?.id) {
                 return;
               }
 
@@ -316,13 +328,17 @@ class ChatwootImport {
 
               sqlInsertMsg += `(${bindContent}, ${bindContent}, $1, $2, ${bindConversationId}, ${bindMessageType}, FALSE, 0,
                   ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
+              valuesCount++;
             });
           });
-          if (bindInsertMsg.length > 2) {
-            if (sqlInsertMsg.slice(-1) === ',') {
-              sqlInsertMsg = sqlInsertMsg.slice(0, -1);
-            }
-            totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
+          if (valuesCount > 0) {
+            sqlInsertMsg = sqlInsertMsg.slice(0, -1);
+            sqlInsertMsg += ` ON CONFLICT DO NOTHING`;
+            const result = await pgClient.query(sqlInsertMsg, bindInsertMsg);
+            totalMessagesImported += result?.rowCount ?? 0;
+            this.logger.info(
+              `[${instance.instanceName}] Chunk ${chunkIndex}: inserted ${result?.rowCount ?? 0} messages`,
+            );
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -336,7 +352,11 @@ class ChatwootImport {
         ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
       };
 
-      this.importHistoryContacts(instance, providerData);
+      await this.importHistoryContacts(instance, providerData);
+
+      this.logger.info(
+        `[${instance.instanceName}] Message import complete: ${totalMessagesImported} messages imported`,
+      );
 
       return totalMessagesImported;
     } catch (error) {
@@ -344,6 +364,8 @@ class ChatwootImport {
 
       this.deleteHistoryMessages(instance);
       this.deleteRepositoryMessagesCache(instance);
+
+      throw error;
     }
   }
 
@@ -409,22 +431,36 @@ class ChatwootImport {
                 INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
                 SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
                 FROM new_contact
+                ON CONFLICT (contact_id, inbox_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
                 RETURNING id, contact_id, created_at, updated_at
               ),
 
               new_conversation AS (
                 INSERT INTO conversations (account_id, inbox_id, status, contact_id,
                   contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
-                SELECT $1, $2, 0, new_contact_inbox.contact_id, new_contact_inbox.id, gen_random_uuid(),
-                  new_contact_inbox.updated_at, new_contact_inbox.created_at, new_contact_inbox.updated_at
-                FROM new_contact_inbox
+                SELECT $1, $2, 0, nci.contact_id, nci.id, gen_random_uuid(),
+                  nci.updated_at, nci.created_at, nci.updated_at
+                FROM new_contact_inbox nci
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM conversations con
+                  WHERE con.contact_inbox_id = nci.id AND con.account_id = $1
+                )
                 RETURNING id, contact_id
               )
 
-              SELECT new_contact.identifier AS contact_key, new_contact.phone_number,
-                new_contact.id AS contact_id, new_conversation.id AS conversation_id
-              FROM new_conversation
-              JOIN new_contact ON new_conversation.contact_id = new_contact.id
+              SELECT nc.identifier AS contact_key, nc.phone_number,
+                nc.id AS contact_id, nconv.id AS conversation_id
+              FROM new_conversation nconv
+              JOIN new_contact nc ON nconv.contact_id = nc.id
+
+              UNION
+
+              SELECT nc.identifier AS contact_key, nc.phone_number,
+                nc.id AS contact_id, con.id AS conversation_id
+              FROM new_contact nc
+              JOIN new_contact_inbox nci ON nci.contact_id = nc.id
+              JOIN conversations con ON con.contact_inbox_id = nci.id AND con.account_id = $1
+              WHERE nc.id NOT IN (SELECT contact_id FROM new_conversation)
 
               UNION
 

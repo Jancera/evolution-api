@@ -2735,8 +2735,9 @@ export class ChatwootService {
     instanceName: string,
     daysLimit?: number,
     batchSize?: number,
-  ): Promise<{ totalMessagesImported: number; batchesProcessed: number }> {
+  ): Promise<{ totalMessagesImported: number; batchesProcessed: number; errors: string[] }> {
     const effectiveBatchSize = Math.min(10000, Math.max(1000, batchSize ?? 5000));
+    const errors: string[] = [];
 
     const instance = await this.prismaRepository.instance.findFirst({
       where: { name: instanceName },
@@ -2781,12 +2782,14 @@ export class ChatwootService {
 
     chatwootImport.clearAll(instanceDto);
 
-    // Import contacts first so messages are wrapped around the correct contact (phone number)
+    this.logger.info(`[${instanceName}] Starting importFromEvolutionDb (daysLimit=${daysLimit ?? 'none'})`);
+
     const evolutionContacts = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
     const contactsToImport = evolutionContacts.filter((c) => !chatwootImport.isIgnorePhoneNumber(c.remoteJid));
     if (contactsToImport.length > 0) {
+      this.logger.info(`[${instanceName}] Importing ${contactsToImport.length} contacts`);
       chatwootImport.addHistoryContacts(instanceDto, contactsToImport);
       const providerData: ChatwootDto = {
         ...this.provider,
@@ -2794,7 +2797,13 @@ export class ChatwootService {
           ? this.provider.ignoreJids.map((event) => String(event))
           : [],
       };
-      await chatwootImport.importHistoryContacts(instanceDto, providerData);
+      try {
+        await chatwootImport.importHistoryContacts(instanceDto, providerData);
+      } catch (error) {
+        const msg = `Contact import failed: ${error?.toString()}`;
+        this.logger.error(`[${instanceName}] ${msg}`);
+        errors.push(msg);
+      }
     }
 
     const where: any = { instanceId: instance.id };
@@ -2837,24 +2846,32 @@ export class ChatwootService {
 
       if (prepared.length > 0) {
         chatwootImport.addHistoryMessages(instanceDto, prepared as MessageModel[]);
-        const imported = await chatwootImport.importHistoryMessages(
-          instanceDto,
-          this,
-          inbox,
-          this.provider as ChatwootModel,
-        );
-        totalMessagesImported += Number.isInteger(imported) ? imported : 0;
+        try {
+          const imported = await chatwootImport.importHistoryMessages(
+            instanceDto,
+            this,
+            inbox,
+            this.provider as ChatwootModel,
+          );
+          totalMessagesImported += Number.isInteger(imported) ? imported : 0;
+        } catch (error) {
+          const msg = `Batch ${batchesProcessed + 1} message import failed: ${error?.toString()}`;
+          this.logger.error(`[${instanceName}] ${msg}`);
+          errors.push(msg);
+        }
       }
 
       batchesProcessed++;
       lastId = batch[batch.length - 1].id;
+      this.logger.info(
+        `[${instanceName}] Batch ${batchesProcessed}: ${batch.length} fetched, ${prepared.length} prepared, total imported so far: ${totalMessagesImported}`,
+      );
 
       if (batch.length < effectiveBatchSize) {
         done = true;
       }
     }
 
-    // Re-import contacts at end: Evolution Contact table + contacts extracted from messages (@lid etc.)
     const evolutionContactsEnd = await this.prismaRepository.contact.findMany({
       where: { instanceId: instance.id },
     });
@@ -2872,6 +2889,9 @@ export class ChatwootService {
       }
     }
     if (contactsToImportEnd.length > 0) {
+      this.logger.info(
+        `[${instanceName}] Re-importing ${contactsToImportEnd.length} contacts (including from messages)`,
+      );
       chatwootImport.addHistoryContacts(instanceDto, contactsToImportEnd);
       const providerDataEnd: ChatwootDto = {
         ...this.provider,
@@ -2879,9 +2899,41 @@ export class ChatwootService {
           ? this.provider.ignoreJids.map((event) => String(event))
           : [],
       };
-      await chatwootImport.importHistoryContacts(instanceDto, providerDataEnd);
+      try {
+        await chatwootImport.importHistoryContacts(instanceDto, providerDataEnd);
+      } catch (error) {
+        const msg = `Final contact re-import failed: ${error?.toString()}`;
+        this.logger.error(`[${instanceName}] ${msg}`);
+        errors.push(msg);
+      }
     }
 
-    return { totalMessagesImported, batchesProcessed };
+    try {
+      await this.updateConversationsLastActivity(this.provider);
+    } catch (error) {
+      this.logger.error(`[${instanceName}] Failed to update conversation last_activity_at: ${error?.toString()}`);
+    }
+
+    this.logger.info(
+      `[${instanceName}] importFromEvolutionDb complete: ${totalMessagesImported} messages, ${batchesProcessed} batches, ${errors.length} errors`,
+    );
+
+    return { totalMessagesImported, batchesProcessed, errors };
+  }
+
+  private async updateConversationsLastActivity(provider: ChatwootModel): Promise<void> {
+    const pgClient = postgresClient.getChatwootConnection();
+    const sql = `
+      UPDATE conversations SET last_activity_at = sub.max_created
+      FROM (
+        SELECT conversation_id, MAX(created_at) AS max_created
+        FROM messages
+        WHERE account_id = $1
+        GROUP BY conversation_id
+      ) sub
+      WHERE conversations.id = sub.conversation_id
+        AND conversations.account_id = $1
+        AND (conversations.last_activity_at IS NULL OR conversations.last_activity_at < sub.max_created)`;
+    await pgClient.query(sql, [provider.accountId]);
   }
 }
